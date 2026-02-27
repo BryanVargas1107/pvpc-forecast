@@ -70,7 +70,14 @@ def get_esios_token() -> str:
 def build_headers(token: str) -> dict:
     """
     Construye las cabeceras HTTP que requiere la API de ESIOS.
-    Incluye un User-Agent personalizado para evitar bloqueos por firewall.
+
+    Cabeceras requeridas:
+    - Authorization: autenticación con token personal de ESIOS.
+    - Accept / Content-Type: indican que trabajamos con JSON.
+    - User-Agent: identifica el cliente. Sin esta cabecera el firewall
+      de REE rechaza la petición con un 403 Forbidden.
+    - x-api-key: cabecera alternativa de autenticación, añadida por
+      compatibilidad con distintas versiones del gateway de la API.
     """
     return {
         "Accept": "application/json; application/vnd.esios-api-v2+json",
