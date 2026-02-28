@@ -335,13 +335,12 @@ def fit_prophet(train: pd.Series, val: pd.Series) -> tuple:
     })
 
     modelo = Prophet(
-    daily_seasonality=True,
-    weekly_seasonality=True,
-    yearly_seasonality=False,   # ← desactivar: solo tenemos 7 meses
-    changepoint_prior_scale=0.1,    # ← más flexible que antes (0.05)
-    seasonality_prior_scale=5,      # ← reducimos para evitar overfitting
-    seasonality_mode="multiplicative",  # ← mejor para series con picos altos
-)
+        daily_seasonality=True,    # ciclo de 24 horas
+        weekly_seasonality=True,   # ciclo semanal
+        yearly_seasonality=True,   # ciclo anual (tenemos 7 meses, útil pero limitado)
+        changepoint_prior_scale=0.05,  # rigidez de la tendencia (0.05 = poco flexible)
+        seasonality_prior_scale=10,    # fuerza de las estacionalidades
+    )
 
     modelo.fit(df_prophet)
     logger.info("Prophet ajustado ✓")
@@ -438,6 +437,166 @@ def main():
     print(f"\n🏆 Mejor modelo en validación: {mejor_modelo}")
     print("\n⚠️  El conjunto de TEST no se ha usado todavía.")
     print("    Úsalo solo una vez, cuando hayas elegido el modelo definitivo.")
+
+
+# ---------------------------------------------------------------------------
+# 9. MODELO MULTIVARIABLE — XGBOOST
+# ---------------------------------------------------------------------------
+
+FEATURE_COLS = [
+    # Temporales
+    "hora", "dia_semana", "mes", "es_fin_de_semana",
+    # Lags de precio
+    "precio_lag_24h", "precio_lag_48h", "precio_lag_168h", "precio_media_24h",
+    # Meteorológicas
+    "temperature_2m", "cloudcover", "shortwave_radiation",
+    "windspeed_10m", "precipitation",
+]
+TARGET_COL = "precio_eur_mwh"
+
+
+def load_multivariate_data() -> pd.DataFrame:
+    """
+    Carga el dataset multivariable (precio + meteorología + features)
+    más reciente de data/processed/.
+
+    Returns:
+        DataFrame completo con features y variable objetivo.
+    """
+    csv_files = sorted(
+        DATA_PROCESSED_DIR.glob("pvpc_multivariate_*.csv"),
+        key=lambda f: f.stat().st_mtime,
+    )
+    if not csv_files:
+        raise FileNotFoundError(
+            "No se encontró ningún CSV multivariable en data/processed/. "
+            "Ejecuta primero el notebook de preparación de datos."
+        )
+    latest = csv_files[-1]
+    logger.info(f"Cargando dataset multivariable: {latest.name}")
+    df = pd.read_csv(latest, index_col="datetime_utc", parse_dates=True)
+    df.index = pd.to_datetime(df.index, utc=True)
+    return df.sort_index()
+
+
+def split_multivariate(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Divide el dataset multivariable en train, val y test de forma cronológica.
+
+    Usa las mismas proporciones que split_data() para que los períodos
+    de evaluación sean comparables con los modelos univariables.
+
+    Returns:
+        Tupla (train, val, test) como DataFrames.
+    """
+    n       = len(df)
+    n_train = int(n * TRAIN_RATIO)
+    n_val   = int(n * VAL_RATIO)
+
+    train = df.iloc[:n_train]
+    val   = df.iloc[n_train : n_train + n_val]
+    test  = df.iloc[n_train + n_val :]
+
+    logger.info(f"Train: {len(train)} | Val: {len(val)} | Test: {len(test)}")
+    return train, val, test
+
+
+def fit_xgboost(
+    train: pd.DataFrame,
+    val: pd.DataFrame,
+) -> tuple:
+    """
+    Entrena un modelo XGBoost para regresión sobre el dataset multivariable.
+
+    XGBoost (eXtreme Gradient Boosting) construye un conjunto de árboles
+    de decisión de forma secuencial: cada árbol aprende a corregir los
+    errores del anterior. Es especialmente potente para capturar relaciones
+    no lineales entre variables como la temperatura y el precio eléctrico.
+
+    Hiperparámetros principales:
+        n_estimators:     número de árboles (más = mejor pero más lento)
+        max_depth:        profundidad máxima de cada árbol
+        learning_rate:    cuánto corrige cada árbol los errores anteriores
+        subsample:        fracción de datos usada por árbol (regularización)
+        colsample_bytree: fracción de features usada por árbol (regularización)
+
+    Usamos early_stopping_rounds: el entrenamiento para automáticamente
+    cuando el error en validación deja de mejorar, evitando overfitting.
+
+    Args:
+        train: DataFrame de entrenamiento con features y target.
+        val:   DataFrame de validación para early stopping.
+
+    Returns:
+        Tupla (modelo ajustado, predicciones en val como pd.Series).
+    """
+    from xgboost import XGBRegressor
+
+    X_train = train[FEATURE_COLS]
+    y_train = train[TARGET_COL]
+    X_val   = val[FEATURE_COLS]
+    y_val   = val[TARGET_COL]
+
+    logger.info("Entrenando XGBoost...")
+
+    modelo = XGBRegressor(
+        n_estimators=1000,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        n_jobs=-1,          # usar todos los núcleos disponibles
+        early_stopping_rounds=50,
+        eval_metric="rmse",
+    )
+
+    modelo.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
+
+    n_trees = modelo.best_iteration + 1
+    logger.info(f"XGBoost ajustado — árboles usados: {n_trees} (early stopping)")
+
+    pred_val = pd.Series(
+        modelo.predict(X_val),
+        index=val.index,
+        name="xgboost",
+    ).clip(lower=0)
+
+    return modelo, pred_val
+
+
+def get_feature_importance(modelo, top_n: int = 10) -> pd.Series:
+    """
+    Extrae la importancia de cada feature según XGBoost.
+
+    La importancia mide cuánto contribuye cada variable a reducir
+    el error en los árboles. Es una de las ventajas de XGBoost
+    frente a modelos de caja negra: podemos interpretar qué variables
+    son más relevantes para predecir el precio.
+
+    Args:
+        modelo: Modelo XGBoost ya entrenado.
+        top_n:  Número de features más importantes a devolver.
+
+    Returns:
+        Serie con las importancias ordenadas de mayor a menor.
+    """
+    importancias = pd.Series(
+        modelo.feature_importances_,
+        index=FEATURE_COLS,
+    ).sort_values(ascending=False)
+
+    logger.info("Top features por importancia:")
+    for feat, imp in importancias.head(top_n).items():
+        logger.info(f"  {feat:<30} {imp:.4f}")
+
+    return importancias.head(top_n)
 
 
 if __name__ == "__main__":

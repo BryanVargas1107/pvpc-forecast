@@ -195,12 +195,8 @@ def compute_hourly_profile(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame con índice 0-23 y columnas mean, max, min.
     """
-    # Convertimos a hora local SOLO para el análisis visual
-    df_local = df.copy()
-    df_local.index = df_local.index.tz_convert("Europe/Madrid")
-    
-    profile = df_local.groupby(df_local.index.hour)["precio_eur_mwh"].agg(["mean", "max", "min"])
-    profile.index.name = "hora_local"
+    profile = df.groupby(df.index.hour)["precio_eur_mwh"].agg(["mean", "max", "min"])
+    profile.index.name = "hora"
     return profile.round(2)
 
 
@@ -211,11 +207,8 @@ def compute_daily_profile(df: pd.DataFrame) -> pd.DataFrame:
     Returns:
         DataFrame con el precio medio por día de la semana.
     """
-    df_local = df.copy()
-    df_local.index = df_local.index.tz_convert("Europe/Madrid")
-    
     day_names = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    profile = df_local.groupby(df_local.index.dayofweek)["precio_eur_mwh"].mean()
+    profile = df.groupby(df.index.dayofweek)["precio_eur_mwh"].mean()
     profile.index = day_names
     profile.name = "precio_medio_eur_mwh"
     return profile.round(2)
@@ -306,8 +299,7 @@ def main():
     Pipeline completo: carga → filtra → limpia → analiza → guarda.
     """
     # Busca el JSON más reciente en data/raw/
-    raw_files = sorted(DATA_RAW_DIR.glob("pvpc_*.json"), key=lambda f: f.stat().st_mtime)
-    latest_file = raw_files[-1]  # ahora sí: el modificado más recientemente
+    raw_files = sorted(DATA_RAW_DIR.glob("pvpc_*.json"))
     if not raw_files:
         raise FileNotFoundError(
             "No se encontró ningún archivo JSON en data/raw/. "
@@ -350,6 +342,142 @@ def main():
     save_processed(df_clean, output_name)
 
     print(f"\n✅ Procesamiento completado → data/processed/{output_name}")
+
+
+# ---------------------------------------------------------------------------
+# 7. CARGA Y FUSIÓN DE DATOS METEOROLÓGICOS
+# ---------------------------------------------------------------------------
+
+def load_weather_json(filepath: str | Path) -> pd.DataFrame:
+    """
+    Lee el JSON de Open-Meteo y lo convierte en un DataFrame horario.
+
+    Open-Meteo devuelve listas paralelas bajo la clave 'hourly':
+    una lista de timestamps y una lista por cada variable meteorológica.
+    Las convertimos en columnas de un DataFrame con índice temporal UTC.
+
+    Args:
+        filepath: Ruta al archivo JSON descargado por fetch_weather.py.
+
+    Returns:
+        DataFrame con índice datetime UTC y una columna por variable.
+    """
+    filepath = Path(filepath)
+    logger.info(f"Cargando datos meteorológicos: {filepath.name}")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    hourly = raw["hourly"]
+    df = pd.DataFrame(hourly)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.set_index("time").sort_index()
+
+    logger.info(f"Datos meteorológicos cargados: {df.shape[0]} horas × {df.shape[1]} variables")
+    return df
+
+
+def merge_price_weather(
+    df_price: pd.DataFrame,
+    df_weather: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Fusiona el DataFrame de precios con el meteorológico por timestamp UTC.
+
+    Usamos un join de tipo 'inner' para quedarnos solo con las horas
+    que tienen datos en ambos DataFrames. Esto evita introducir NaN
+    en las variables meteorológicas, que confundirían al modelo.
+
+    Args:
+        df_price:   DataFrame limpio del PVPC con índice datetime UTC.
+        df_weather: DataFrame meteorológico con índice datetime UTC.
+
+    Returns:
+        DataFrame combinado con precio y variables meteorológicas.
+    """
+    # Eliminamos la columna 'geo_name' que no es útil para el modelo
+    df_price_clean = df_price[["precio_eur_mwh"]].copy()
+
+    df_merged = df_price_clean.join(df_weather, how="inner")
+
+    n_dropped = len(df_price_clean) - len(df_merged)
+    if n_dropped > 0:
+        logger.warning(f"Horas eliminadas por falta de datos meteorológicos: {n_dropped}")
+
+    logger.info(
+        f"Dataset combinado: {df_merged.shape[0]} horas × {df_merged.shape[1]} variables "
+        f"({df_merged.index.min().date()} → {df_merged.index.max().date()})"
+    )
+    return df_merged
+
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construye variables de entrada (features) para el modelo XGBoost.
+
+    XGBoost no entiende fechas — hay que convertir el tiempo en números
+    que capture los patrones temporales. Añadimos también variables lag
+    (el precio de horas anteriores), que son muy predictivas en series
+    temporales eléctricas.
+
+    Features temporales:
+        hora, dia_semana, mes, es_fin_de_semana
+
+    Features lag (precio pasado):
+        precio_lag_24h   → precio de ayer a la misma hora
+        precio_lag_48h   → precio de hace 2 días a la misma hora
+        precio_lag_168h  → precio de hace 7 días a la misma hora (mismo día semana)
+        precio_media_24h → media de las últimas 24 horas (tendencia reciente)
+
+    Features meteorológicas:
+        temperature_2m, cloudcover, shortwave_radiation,
+        windspeed_10m, precipitation
+
+    Args:
+        df: DataFrame combinado precio + meteorología con índice UTC.
+
+    Returns:
+        DataFrame con todas las features y la variable objetivo,
+        sin filas NaN (las primeras 168 horas se pierden por los lags).
+    """
+    df = df.copy()
+
+    # --- Features temporales ---
+    df["hora"]            = df.index.hour
+    df["dia_semana"]      = df.index.dayofweek      # 0=lunes, 6=domingo
+    df["mes"]             = df.index.month
+    df["es_fin_de_semana"] = (df.index.dayofweek >= 5).astype(int)
+
+    # --- Features lag ---
+    df["precio_lag_24h"]   = df["precio_eur_mwh"].shift(24)
+    df["precio_lag_48h"]   = df["precio_eur_mwh"].shift(48)
+    df["precio_lag_168h"]  = df["precio_eur_mwh"].shift(168)  # mismo día, semana pasada
+    df["precio_media_24h"] = df["precio_eur_mwh"].rolling(24).mean()
+
+    # Eliminar filas con NaN (los primeros 168 registros no tienen lag completo)
+    n_antes = len(df)
+    df = df.dropna()
+    logger.info(f"Features construidas. Filas eliminadas por lags: {n_antes - len(df)} | Quedan: {len(df)}")
+
+    return df
+
+
+def save_multivariate_dataset(df: pd.DataFrame, filename: str) -> Path:
+    """
+    Guarda el dataset multivariable en data/processed/.
+
+    Args:
+        df:       DataFrame con features y variable objetivo.
+        filename: Nombre del archivo de salida.
+
+    Returns:
+        Ruta completa del archivo guardado.
+    """
+    DATA_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = DATA_PROCESSED_DIR / filename
+    df.to_csv(output_path)
+    logger.info(f"Dataset multivariable guardado en: {output_path}")
+    return output_path
 
 
 if __name__ == "__main__":
