@@ -11,8 +11,9 @@ Documentación API: https://www.esios.ree.es/es/pagina/api
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from pprint import pprint
 
 import requests
 from dotenv import load_dotenv
@@ -149,6 +150,9 @@ def parse_pvpc(raw_json: dict) -> list[dict]:
     """
     try:
         values = raw_json["indicator"]["values"]
+        # DEBUG: ver todos los campos disponibles en el primer registro
+        import pprint
+        pprint.pprint(values[0])
     except KeyError as e:
         raise ValueError(f"Estructura del JSON inesperada. Clave no encontrada: {e}")
 
@@ -196,7 +200,7 @@ def main():
     Por defecto descarga los datos de los últimos 7 días.
     """
     # Rango de fechas: últimos 7 días
-    end_date = datetime.utcnow().date()
+    end_date = datetime.now(timezone.utc).date()
     start_date = end_date - timedelta(days=7)
 
     start_str = start_date.strftime("%Y-%m-%d")
