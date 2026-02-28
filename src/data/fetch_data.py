@@ -8,6 +8,7 @@ Indicador usado: 1001 — PVPC (€/MWh)
 Documentación API: https://www.esios.ree.es/es/pagina/api
 """
 
+import argparse
 import os
 import json
 import logging
@@ -192,25 +193,56 @@ def save_raw_json(raw_json: dict, filename: str) -> Path:
     logger.info(f"JSON original guardado en: {output_path}")
     return output_path
 
+def parse_arguments() -> argparse.Namespace:
+    """
+    Define y procesa los argumentos de línea de comandos.
+
+    Permite especificar el rango de fechas al ejecutar el script,
+    lo que facilita descargar históricos sin modificar el código.
+
+    Uso:
+        # Últimos 7 días (por defecto)
+        python src/data/fetch_data.py
+
+        # Rango personalizado
+        python src/data/fetch_data.py --start 2025-08-01 --end 2026-02-27
+    """
+    parser = argparse.ArgumentParser(
+        description="Descarga datos del PVPC desde la API de ESIOS (REE)."
+    )
+    parser.add_argument(
+        "--start",
+        type=str,
+        default=None,
+        help="Fecha de inicio en formato YYYY-MM-DD (default: hace 7 días)",
+    )
+    parser.add_argument(
+        "--end",
+        type=str,
+        default=None,
+        help="Fecha de fin en formato YYYY-MM-DD (default: hoy)",
+    )
+    return parser.parse_args()
 
 def main():
     """
     Punto de entrada principal del script.
 
-    Por defecto descarga los datos de los últimos 7 días.
+    Por defecto descarga los últimos 7 días. Acepta --start y --end
+    como argumentos para descargar cualquier rango histórico.
     """
-    # Rango de fechas: últimos 7 días
-    end_date = datetime.now(timezone.utc).date()
-    start_date = end_date - timedelta(days=7)
+    args = parse_arguments()
 
-    start_str = start_date.strftime("%Y-%m-%d")
-    end_str = end_date.strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).date()
+
+    end_date   = args.end   or today.strftime("%Y-%m-%d")
+    start_date = args.start or (today - timedelta(days=7)).strftime("%Y-%m-%d")
 
     # 1. Descarga
-    raw_json = fetch_pvpc(start_date=start_str, end_date=end_str)
+    raw_json = fetch_pvpc(start_date=start_date, end_date=end_date)
 
     # 2. Guarda el JSON original
-    filename = f"pvpc_{start_str}_{end_str}.json"
+    filename = f"pvpc_{start_date}_{end_date}.json"
     save_raw_json(raw_json, filename)
 
     # 3. Extrae los campos de interés
