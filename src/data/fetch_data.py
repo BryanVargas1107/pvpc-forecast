@@ -151,9 +151,7 @@ def parse_pvpc(raw_json: dict) -> list[dict]:
     """
     try:
         values = raw_json["indicator"]["values"]
-        # DEBUG: ver todos los campos disponibles en el primer registro
-        import pprint
-        pprint.pprint(values[0])
+
     except KeyError as e:
         raise ValueError(f"Estructura del JSON inesperada. Clave no encontrada: {e}")
 

@@ -306,7 +306,8 @@ def main():
     Pipeline completo: carga → filtra → limpia → analiza → guarda.
     """
     # Busca el JSON más reciente en data/raw/
-    raw_files = sorted(DATA_RAW_DIR.glob("pvpc_*.json"))
+    raw_files = sorted(DATA_RAW_DIR.glob("pvpc_*.json"), key=lambda f: f.stat().st_mtime)
+    latest_file = raw_files[-1]  # ahora sí: el modificado más recientemente
     if not raw_files:
         raise FileNotFoundError(
             "No se encontró ningún archivo JSON en data/raw/. "
