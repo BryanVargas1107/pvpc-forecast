@@ -1,14 +1,18 @@
 """
 predict.py
 ----------
-Genera predicciones del PVPC para las próximas 24 horas usando Prophet.
+Genera predicciones del PVPC para las próximas 24 horas usando XGBoost
+entrenado sobre datos de precio + variables meteorológicas de Open-Meteo.
 
 Uso:
-    python predict.py              # predice las próximas 24 horas
+    python predict.py              # predice y muestra en consola
+    python predict.py --email      # predice y envía correo a los destinatarios
     python predict.py --horas 48   # predice las próximas 48 horas
 
 Flujo:
-    API ESIOS → datos frescos → limpieza → Prophet → predicción → CSV
+    API ESIOS → precio fresco
+    API Open-Meteo → meteorología fresca + próximas horas (forecast)
+    Fusión + features → XGBoost → predicción → consola / email
 """
 
 import argparse
@@ -17,15 +21,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 
-# Importamos las funciones ya construidas en fases anteriores
-# Así no duplicamos código — reutilizamos lo que ya funciona
 import sys
 sys.path.append(str(Path(__file__).resolve().parent / "src"))
 
 from data.fetch_data    import fetch_pvpc, save_raw_json
-from data.process_data  import load_raw_json, filter_by_geo, clean_data
-from models.train_models import fit_prophet
+from data.fetch_weather import fetch_weather, save_weather_json
+from data.process_data  import (
+    load_raw_json, filter_by_geo, clean_data,
+    load_weather_json, merge_price_weather, build_features,
+)
+from models.train_models import fit_xgboost, FEATURE_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -42,139 +49,187 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # CONSTANTES
 # ---------------------------------------------------------------------------
-PREDICTIONS_DIR  = Path(__file__).resolve().parent / "data" / "predictions"
-DAYS_OF_HISTORY  = 60   # días de histórico para entrenar Prophet en producción
+PREDICTIONS_DIR = Path(__file__).resolve().parent / "data" / "predictions"
+DAYS_OF_HISTORY = 60
 
 
 # ---------------------------------------------------------------------------
 # FUNCIONES
 # ---------------------------------------------------------------------------
 
-def fetch_recent_data() -> pd.Series:
+def fetch_fresh_data(start_date: str, end_date: str) -> pd.DataFrame:
     """
-    Descarga los últimos DAYS_OF_HISTORY días frescos de la API y
-    devuelve una serie temporal limpia lista para entrenar.
-
-    Siempre descarga datos frescos para que el modelo conozca
-    los patrones de precios más recientes.
-    """
-    today      = datetime.now(timezone.utc).date()
-    start_date = (today - timedelta(days=DAYS_OF_HISTORY)).strftime("%Y-%m-%d")
-    end_date   = today.strftime("%Y-%m-%d")
-
-    logger.info(f"Descargando datos frescos: {start_date} → {end_date}")
-    raw_json = fetch_pvpc(start_date=start_date, end_date=end_date)
-
-    filename = f"pvpc_{start_date}_{end_date}.json"
-    save_raw_json(raw_json, filename)
-
-    df_raw      = load_raw_json(Path(__file__).resolve().parent / "data" / "raw" / filename)
-    df_filtered = filter_by_geo(df_raw)
-    serie       = clean_data(df_filtered)["precio_eur_mwh"]
-
-    logger.info(f"Datos listos: {len(serie)} horas de histórico")
-    return serie
-
-
-def generate_forecast(serie: pd.Series, horas: int) -> pd.DataFrame:
-    """
-    Entrena Prophet sobre la serie recibida y genera predicciones.
-
-    Para predicción en producción entrenamos con todos los datos
-    disponibles (no dividimos en train/val/test — eso es solo
-    para evaluar, no para predecir en producción).
-
-    Args:
-        serie: Serie temporal limpia con histórico reciente.
-        horas: Número de horas a predecir hacia el futuro.
+    Descarga precio PVPC y meteorología para el rango dado,
+    los fusiona y construye las features para XGBoost.
 
     Returns:
-        DataFrame con columnas: datetime_utc, hora_local,
-        precio_predicho, limite_inferior, limite_superior.
+        DataFrame con todas las features listo para predecir.
     """
-    logger.info(f"Entrenando Prophet sobre {len(serie)} horas de datos...")
+    # --- Precio ---
+    logger.info("Descargando precio PVPC...")
+    raw_pvpc = fetch_pvpc(start_date=start_date, end_date=end_date)
+    pvpc_file = f"pvpc_{start_date}_{end_date}.json"
+    save_raw_json(raw_pvpc, pvpc_file)
 
-    # Creamos un conjunto de validación ficticio del tamaño del horizonte
-    # solo para que fit_prophet pueda generar el número correcto de pasos
-    frecuencia    = pd.tseries.frequencies.to_offset(pd.infer_freq(serie.index[-48:]))
-    indice_futuro = pd.date_range(
-        start=serie.index[-1] + frecuencia,
-        periods=horas,
-        freq=frecuencia,
-        tz=serie.index.tz,
+    df_raw      = load_raw_json(Path("data/raw") / pvpc_file)
+    df_filtered = filter_by_geo(df_raw)
+    df_precio   = clean_data(df_filtered)
+
+    # --- Meteorología histórica ---
+    logger.info("Descargando meteorología histórica...")
+    raw_weather = fetch_weather(start_date, end_date)
+    weather_file = f"weather_{start_date}_{end_date}.json"
+    save_weather_json(raw_weather, weather_file)
+    df_weather = load_weather_json(Path("data/raw") / weather_file)
+
+    # --- Fusión y features ---
+    df_merged   = merge_price_weather(df_precio, df_weather)
+    df_features = build_features(df_merged)
+
+    return df_features
+
+
+def fetch_weather_forecast(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Descarga el pronóstico meteorológico de Open-Meteo para las próximas horas.
+    """
+    import requests
+
+    params = {
+        "latitude":        40.42,
+        "longitude":       -3.70,
+        "start_date":      start_date,
+        "end_date":        end_date,
+        "hourly":          "temperature_2m,cloudcover,shortwave_radiation,windspeed_10m,precipitation",
+        "timezone":        "UTC",
+        "wind_speed_unit": "kmh",
+    }
+
+    logger.info(f"Descargando forecast meteorológico {start_date} → {end_date}...")
+    response = requests.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=30)
+    response.raise_for_status()
+
+    data   = response.json()
+    hourly = data["hourly"]
+
+    df = pd.DataFrame(hourly)
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.set_index("time").sort_index()
+
+    logger.info(f"Forecast meteorológico: {len(df)} horas")
+    return df
+
+
+def generate_xgboost_forecast(df_history: pd.DataFrame, horas: int) -> pd.DataFrame:
+    """
+    Entrena XGBoost sobre el histórico reciente y predice las próximas horas
+    de forma recursiva, usando forecast meteorológico real de Open-Meteo.
+    """
+    # Entrenar con todo el histórico (últimas 24h como val para early stopping)
+    val_size   = 24
+    train_data = df_history.iloc[:-val_size]
+    val_data   = df_history.iloc[-val_size:]
+    modelo, _  = fit_xgboost(train_data, val_data)
+
+    # Forecast meteorológico para las horas futuras
+    today    = datetime.now(timezone.utc).date()
+    tomorrow = today + timedelta(days=max(2, horas // 24 + 1))
+    df_meteo_forecast = fetch_weather_forecast(
+        today.strftime("%Y-%m-%d"),
+        tomorrow.strftime("%Y-%m-%d"),
     )
-    horizonte_ficticio = pd.Series(index=indice_futuro, dtype=float)
 
-    _, pred_serie, forecast_completo = fit_prophet(serie, horizonte_ficticio)
+    freq            = pd.tseries.frequencies.to_offset("h")
+    ultima_hora     = df_history.index[-1]
+    precio_conocido = df_history["precio_eur_mwh"].copy()
 
-    # Enriquecer con intervalos de confianza y hora local española
-    df_result = pd.DataFrame({
-        "datetime_utc":      pred_serie.index,
-        "precio_predicho":   forecast_completo["yhat"].values.clip(min=0).round(2),
-        "limite_inferior":   forecast_completo["yhat_lower"].values.clip(min=0).round(2),
-        "limite_superior":   forecast_completo["yhat_upper"].values.clip(min=0).round(2),
-    })
+    resultados = []
+    for i in range(1, horas + 1):
+        hora_pred = ultima_hora + i * freq
 
-    # Añadir hora local española (CET/CEST) para legibilidad
-    df_result["hora_local"] = (
-        df_result["datetime_utc"]
-        .dt.tz_convert("Europe/Madrid")
-        .dt.strftime("%Y-%m-%d %H:%M")
-    )
+        # Features temporales
+        features = {
+            "hora":             hora_pred.hour,
+            "dia_semana":       hora_pred.dayofweek,
+            "mes":              hora_pred.month,
+            "es_fin_de_semana": int(hora_pred.dayofweek >= 5),
+        }
 
-    return df_result
+        # Lags — precio real o predicho según disponibilidad
+        def get_precio(ts):
+            if ts in precio_conocido.index:
+                return precio_conocido[ts]
+            for r in resultados:
+                if r["datetime_utc"] == ts:
+                    return r["precio_predicho"]
+            return precio_conocido.iloc[-1]
+
+        features["precio_lag_24h"]   = get_precio(hora_pred - timedelta(hours=24))
+        features["precio_lag_48h"]   = get_precio(hora_pred - timedelta(hours=48))
+        features["precio_lag_168h"]  = get_precio(hora_pred - timedelta(hours=168))
+        features["precio_media_24h"] = precio_conocido.iloc[-24:].mean()
+
+        # Meteorología del forecast
+        if hora_pred in df_meteo_forecast.index:
+            meteo = df_meteo_forecast.loc[hora_pred]
+            features["temperature_2m"]      = meteo["temperature_2m"]
+            features["cloudcover"]          = meteo["cloudcover"]
+            features["shortwave_radiation"] = meteo["shortwave_radiation"]
+            features["windspeed_10m"]       = meteo["windspeed_10m"]
+            features["precipitation"]       = meteo["precipitation"]
+        else:
+            misma_hora = df_history[df_history.index.hour == hora_pred.hour]
+            for col in ["temperature_2m", "cloudcover", "shortwave_radiation",
+                        "windspeed_10m", "precipitation"]:
+                features[col] = misma_hora[col].mean() if col in misma_hora.columns else 0
+
+        # Predicción
+        X           = pd.DataFrame([features])[FEATURE_COLS]
+        precio_pred = max(0, float(modelo.predict(X)[0]))
+        margen      = precio_pred * 0.15
+        hora_local  = hora_pred.tz_convert("Europe/Madrid").strftime("%Y-%m-%d %H:%M")
+
+        resultados.append({
+            "datetime_utc":    hora_pred,
+            "hora_local":      hora_local,
+            "precio_predicho": round(precio_pred, 2),
+            "limite_inferior": round(max(0, precio_pred - margen), 2),
+            "limite_superior": round(precio_pred + margen, 2),
+        })
+
+    return pd.DataFrame(resultados)
 
 
 def save_predictions(df: pd.DataFrame) -> Path:
-    """
-    Guarda las predicciones en data/predictions/ con timestamp en el nombre.
-
-    Usar un directorio separado para predicciones evita mezclarlas
-    con los datos procesados históricos.
-    """
     PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
-    filename  = f"prediccion_pvpc_{timestamp}.csv"
-    filepath  = PREDICTIONS_DIR / filename
-
+    filepath  = PREDICTIONS_DIR / f"prediccion_pvpc_{timestamp}.csv"
     df.to_csv(filepath, index=False)
     logger.info(f"Predicciones guardadas en: {filepath}")
     return filepath
 
 
 def print_forecast_table(df: pd.DataFrame) -> None:
-    """
-    Imprime las predicciones en consola con formato legible.
-    Destaca las horas más caras y más baratas.
-    """
     precio_max = df["precio_predicho"].max()
     precio_min = df["precio_predicho"].min()
 
-    print("\n" + "=" * 65)
-    print("  PREDICCIÓN PVPC — PRÓXIMAS HORAS (Península)")
-    print("=" * 65)
-    print(f"  {'Hora local (CET/CEST)':<25} {'Precio (€/MWh)':>14}  {'Intervalo':>20}")
-    print("-" * 65)
+    print("\n" + "=" * 68)
+    print("  PREDICCIÓN PVPC — PRÓXIMAS HORAS (Península) · XGBoost")
+    print("=" * 68)
+    print(f"  {'Hora local (CET/CEST)':<25} {'Precio (€/MWh)':>14}  {'Intervalo':>22}")
+    print("-" * 68)
 
     for _, row in df.iterrows():
-        precio   = row["precio_predicho"]
+        precio    = row["precio_predicho"]
         intervalo = f"[{row['limite_inferior']:.0f} – {row['limite_superior']:.0f}]"
+        etiqueta  = "  ▲ más caro" if precio == precio_max else ("  ▼ más barato" if precio == precio_min else "")
+        print(f"  {row['hora_local']:<25} {precio:>12.2f}  {intervalo:>24}{etiqueta}")
 
-        # Etiqueta visual para máximo y mínimo
-        if precio == precio_max:
-            etiqueta = "  ▲ más caro"
-        elif precio == precio_min:
-            etiqueta = "  ▼ más barato"
-        else:
-            etiqueta = ""
-
-        print(f"  {row['hora_local']:<25} {precio:>12.2f}  {intervalo:>22}{etiqueta}")
-
-    print("=" * 65)
+    print("=" * 68)
     print(f"  Media predicha:  {df['precio_predicho'].mean():.2f} €/MWh")
     print(f"  Hora más barata: {df.loc[df['precio_predicho'].idxmin(), 'hora_local']}")
     print(f"  Hora más cara:   {df.loc[df['precio_predicho'].idxmax(), 'hora_local']}")
-    print("=" * 65)
+    print("=" * 68)
 
 
 # ---------------------------------------------------------------------------
@@ -183,34 +238,33 @@ def print_forecast_table(df: pd.DataFrame) -> None:
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Predice el precio del PVPC usando Prophet."
+        description="Predice el precio del PVPC con XGBoost + datos meteorológicos."
     )
-    parser.add_argument(
-        "--horas",
-        type=int,
-        default=24,
-        help="Número de horas a predecir (default: 24)",
-    )
+    parser.add_argument("--horas", type=int, default=24)
+    parser.add_argument("--email", action="store_true",
+                        help="Enviar predicción por correo electrónico")
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
+    logger.info(f"Iniciando predicción XGBoost para las próximas {args.horas} horas")
 
-    logger.info(f"Iniciando predicción para las próximas {args.horas} horas")
+    today      = datetime.now(timezone.utc).date()
+    start_date = (today - timedelta(days=DAYS_OF_HISTORY)).strftime("%Y-%m-%d")
+    end_date   = today.strftime("%Y-%m-%d")
 
-    # 1. Datos frescos de la API
-    serie = fetch_recent_data()
+    df_history  = fetch_fresh_data(start_date, end_date)
+    df_forecast = generate_xgboost_forecast(df_history, horas=args.horas)
 
-    # 2. Generar predicción
-    df_forecast = generate_forecast(serie, horas=args.horas)
-
-    # 3. Mostrar en consola
     print_forecast_table(df_forecast)
 
-    # 4. Guardar CSV
     ruta = save_predictions(df_forecast)
     print(f"\n📁 CSV guardado en: {ruta}")
+
+    if args.email:
+        from notifications.send_email import send_forecast_email
+        send_forecast_email(df_forecast)
 
 
 if __name__ == "__main__":

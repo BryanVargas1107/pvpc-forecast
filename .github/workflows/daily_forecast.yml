@@ -1,0 +1,46 @@
+name: Daily PVPC Forecast
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  forecast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create data directories
+        run: |
+          mkdir -p data/raw
+          mkdir -p data/processed
+          mkdir -p data/predictions
+
+      - name: Run forecast and send email
+        env:
+          ESIOS_TOKEN:      ${{ secrets.ESIOS_TOKEN }}
+          GMAIL_SENDER:     ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASS:   ${{ secrets.GMAIL_APP_PASS }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+        run: python predict.py --email
+
+      - name: Upload predictions artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prediccion-pvpc-${{ github.run_id }}
+          path: data/predictions/
+          retention-days: 7
