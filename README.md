@@ -16,8 +16,8 @@ reentrena el modelo y envía un correo con la predicción del día.
 |--------|:-----------:|:------------:|:----:|-------|
 | **XGBoost Multivariable** ✅ | **18.27** | **26.54** | **15.04%** | Precio + meteorología |
 | Prophet | 36.15 | 42.61 | 38.55% | Solo precio |
-| Naive Seasonal | — | — | ~34% | Solo precio |
-| SARIMA(1,1,1)(1,1,1,24) | — | — | ~51% | Solo precio |
+| Naive Seasonal | 36.1 | 50.8 | ~34% | Solo precio |
+| SARIMA(1,1,1)(1,1,1,24) | 60.2 | 74.6 | ~59% | Solo precio |
 
 > Evaluación sobre conjunto de **test** (enero–febrero 2026, 738 horas).
 > XGBoost mejora el MAPE un **61%** sobre Prophet al incorporar variables meteorológicas.
@@ -229,6 +229,7 @@ El workflow `daily_forecast.yml` se ejecuta **cada día a las 6:00 UTC** de form
 
 ## 👤 Autor
 
+Bryan Vargas Sanchez
 Proyecto de aprendizaje personal — Grado en Ciencia de Datos.
 Desarrollado como ejercicio de construcción de un pipeline de datos completo,
 desde la ingesta de datos en crudo hasta la predicción automatizada en producción.
