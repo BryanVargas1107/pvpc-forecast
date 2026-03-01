@@ -21,7 +21,11 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --upgrade pip
+          pip install requests python-dotenv pandas numpy statsmodels scikit-learn xgboost
+          pip install prophet --no-deps
+          pip install convertdate lunarcalendar holidays tqdm pystan cmdstanpy
 
       - name: Create data directories
         run: |
